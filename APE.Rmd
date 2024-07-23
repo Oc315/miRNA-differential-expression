@@ -1,0 +1,309 @@
+---
+title: "APE_Sample"
+author: "Oceanus Zhang"
+date: "2024-05-16"
+output: pdf_document
+---
+
+Step 1: Load necessary libraries
+```{r setup, include=FALSE}
+# Loading packages; be familiar with frequently used packages
+library(data.table, quietly=TRUE) # Handle data with functions like `data.table()`, `fread()`, and `setDT()`. Allows for fast data manipulation.
+library(edgeR, quietly=TRUE) # RNA-Seq differential expression analysis with 'edgeR':Create a 'DGEList' object from your count data, estimate dispersions, and perform differential expression analysis using 'exactTest()' or other relevant functions.
+library(sva, quietly=TRUE) #Surrogate variable analysis (SVA) is a statistical method used to identify and account for hidden sources of variation (surrogate variables) in high-dimensional omics data, such as gene expression data from RNA-Seq experiments
+library(variancePartition, quietly=TRUE)# To decompose gene expression variation into components attributed to different factors in the data.
+library(argparse, quietly=TRUE) #Create argument parsers using the 'ArgumentParser()' function and define the arguments your script should accept.
+library(ggplot2, quietly=TRUE) #Create plots using 'ggplot()' and customize them with layers, themes, and geoms.
+library(gridExtra, quietly=TRUE) # Use functions like 'grid.arrange()' to arrange multiple plots in a grid layout and enhance the presentation of your results.
+library(dplyr, quietly=TRUE)
+rm(list=ls())
+knitr::opts_chunk$set(echo=FALSE, warning=FALSE, message=FALSE, include=TRUE, collapse=FALSE, comment="") # Configure Knitr options for code chunk display
+knitr::opts_chunk$set(fig.width=7, fig.height=4) # Set default figure dimensions for code chunk outputs
+
+```
+
+Step 2: Functions
+```{r}
+# Sourcing external functions for additional analyses or plotting.
+source("/Users/oceanuszhang/Library/CloudStorage/OneDrive-EmoryUniversity/Oceanus Zhang/Code and results from Selina/1_Code/manhattan_and_qq_plot_functions.r")
+
+```
+
+Step 3: Analysis Setup
+```{r}
+### Command line arguments
+## Create parser
+parser <- ArgumentParser()
+parser$add_argument("--trait", type="character", default="pil", help="depression or pil")
+parser$add_argument("--noSVs", action="store_true", default=TRUE, help="do not include SVs as covariates")
+
+## Read from parser
+args <- parser$parse_args()
+
+### Constants
+options(stringsAsFactors = FALSE)
+if(args$noSVs) {
+  dirsuffix <- paste0(args$trait, "_noSVs")
+} else {
+  dirsuffix <- paste0(args$trait)
+}
+
+### Files that exist
+file.rawcounts <- "/Users/oceanuszhang/Library/CloudStorage/OneDrive-EmoryUniversity/Oceanus Zhang/Data/miRNA_raw_counts_PCA_filtered.txt"
+file.phenos <- "/Users/oceanuszhang/Library/CloudStorage/OneDrive-EmoryUniversity/Oceanus Zhang/Data/phenos_for_diffex_analysis.txt"
+file.models <- paste0("/Users/oceanuszhang/Desktop/model_info_pil_14.txt")
+### Files to be created
+outdir <- paste0("/Users/oceanuszhang/Desktop/")
+system(paste0("mkdir -p ", outdir))
+out.log <- paste0(outdir, args$trait, ".log")
+
+Outfile.root <- function(amodel) {
+  paste0(outdir, "differential_expression_", amodel, "_", "miRNA_limma") }
+#print(paste0("writing to directory ", outdir))
+
+```
+
+Step 4: Main analysis
+```{r}
+### Read in data
+rawcounts0 <- fread(file.rawcounts)
+phenos.all0 <- fread(file.phenos)
+model.info <- fread(file.models)
+
+### Prepare data
+phenos.all0$msex <- factor(phenos.all0$msex)
+phenos.all0$study <- factor(phenos.all0$study)
+phenos.all0$batch <- factor(phenos.all0$batch)
+phenos.all0$cogdx.2lev <- factor(phenos.all0$cogdx.2lev)
+phenos.all0$r_depres_lv.2lev <- factor(phenos.all0$r_depres_lv.2lev)
+phenos.all0$cesdsum.bl.2lev <- factor(phenos.all0$cesdsum.bl.2lev)
+phenos.all0$antidepressant_tricyclic_rx.bl <- factor(phenos.all0$antidepressant_tricyclic_rx.bl)
+phenos.all0$dcfdx_bl.2lev <- factor(phenos.all0$dcfdx_bl.2lev)
+phenos.all0$dcfdx_lv.2lev <- factor(phenos.all0$dcfdx_lv.2lev)
+phenos.all0$purpose_total.bl.cat2 <- factor(phenos.all0$purpose_total.bl.cat2)
+phenos.all0$purpose_total.bl.cat3 <- factor(phenos.all0$purpose_total.bl.cat3)
+phenos.all0$purpose_total.bl.cat2.controls <- factor(phenos.all0$purpose_total.bl.cat2.controls)
+phenos.all0$purpose_total.bl.cat3.controls  <- factor(phenos.all0$purpose_total.bl.cat3.controls)
+phenos.all0$purpose_total.lv.cat2 <- factor(phenos.all0$purpose_total.lv.cat2)
+phenos.all0$purpose_total.lv.cat3 <- factor(phenos.all0$purpose_total.lv.cat3)
+
+## convert projid to character
+phenos.all0[, projid := as.character(projid)]
+
+
+## filter rawcounts to only samples in the pheno file (which may have gone through some filtering)
+## here, there is no additional filtering
+rawcounts <- rawcounts0[, c(colnames(rawcounts0) %in% c("miRNA", phenos.all0$sample)), with=FALSE]
+
+## restrict phenos.all0 to samples in the data
+phenos.all <- phenos.all0[sample %in% colnames(rawcounts), ]
+
+## harmonize sample order between phenotypes and count data
+setcolorder(rawcounts, c("miRNA", phenos.all$sample))
+
+## make count matrix with one row per miRNA, one column per sample
+## with miRNA name as row name
+counts <- as.matrix(rawcounts[, !c("miRNA")])
+rownames(counts) <- rawcounts$miRNA
+
+### Create DGEList object
+### Calculate normalization factors
+d0 <- DGEList(counts)
+d0 <- calcNormFactors(d0)
+
+model.info$N <- integer()
+model.info$form.full <- character()
+model.info$sig.BH <- integer()
+
+### Loop through models
+for(i in 1:nrow(model.info)) {
+  currmodel <- paste0("model", model.info[i, modelnum])
+  currtrait <- model.info[i, trait]
+  currmodel.forprint <- paste0("Model ", model.info[i, modelnum])
+  
+  cat(paste0("\n", currmodel.forprint, "\n")) ## for report
+  
+  outfile.fit.plot <- paste0(Outfile.root(currmodel), "_fit.png")
+  outfile.qq.plot <- paste0(Outfile.root(currmodel), "_QQ.png")
+  outfile.txt <- paste0(Outfile.root(currmodel), ".txt")
+  
+  ### Specify the variables to include in model
+  techvars <- c("RIN", "pmi", "batch", "study", "age_death", "cogdx.2lev")
+  if(args$trait == "pil") {
+    techvars <- setdiff(techvars, "study")  ## pil available only for MAP
+  }
+  
+  vars <- c(labels(terms(as.formula(model.info[i, form]))), techvars) ## always include 'technical covariates'
+  
+  
+  ### Note if this model includes interaction term
+  withinteract <- ifelse(any(grep(":", vars)), TRUE, FALSE)
+  if(withinteract) { interactionterm <- grep(":", vars, value=TRUE) }
+  
+  ### filter phenotype data to only variables of interest, and only participants with complete data for variables of interest
+  tokeep <- complete.cases(phenos.all[, setdiff(vars, grep(":", vars, value=TRUE)), with=FALSE])
+  
+  
+  ### filter count data and phenos to only samples with complete data for variables in this model
+  d <- d0[, tokeep]
+  phenos <- phenos.all[tokeep, c(setdiff(vars, grep(":", vars, value=TRUE))), with=FALSE]
+  normalized <- cpm(d, log=TRUE)
+   
+  ### Define model formulas
+  modelformula0 <- formula(paste0(" ~", paste0(vars, collapse=" + ")))
+  cat(paste0("model simple form: ", paste(modelformula0, collapse=""), "\n")) ## for report
+  
+  setwd("/Users/oceanuszhang/Desktop")
+  
+  ### Calculate SVs and add to vars and model formula (optional)
+  if(args$noSVs) {  ## if not including SVs, there is nothing to add to modelformula
+    modelformula <- modelformula0
+  } else {
+    ## define full and null models for SVA
+    fullmodel <- modelformula0
+    nullmodel <- update.formula(fullmodel, paste0("~ . -", currtrait)) ## remove trait of interest
+    
+    if(withinteract) { ## if testing interaction, also remove sex and interaction term
+      nullmodel <- update.formula(nullmodel, paste0("~ . -", "msex"))
+      nullmodel <- update.formula(nullmodel, paste0("~ . -", interactionterm))
+    }
+    
+    ## create full model matrix - including both adjustment variables and variables of interest
+    mod <- model.matrix(fullmodel, data = phenos)
+    
+    ## creat null model matrix - including only the adjustment variables
+    ## if no adjustment variables, then include only intercept
+    mod0 <- model.matrix(nullmodel, data = phenos)
+    
+    ## extract normalized counts to give to SVA
+    normcounts <- cpm(d, log=TRUE)
+    
+    ## Determine number of surrogate variables to estimate
+    n.sv <- num.sv(normcounts, mod, method="be", seed=67301014)
+    
+    ## Estimate the surrogate variables
+    ## the component svobj$sv is a matrix whose columns correspond to
+    ## the estimated surrogate variables
+    svobj <- sva(normcounts, mod, mod0, n.sv=n.sv)
+    
+    ## extract svs, add column names, and set as data.table
+    svs <- as.data.frame(svobj$sv)
+    colnames(svs) <- paste0("SV", 1:n.sv)
+    setDT(svs)
+    
+    ## add surrogate variables columns to phenos
+    phenos <- cbind(phenos, svs)
+    
+    ## add surrogate variables terms to modelformula
+    modelformula <- update.formula(modelformula0, paste0("~ . +", paste(colnames(svs), collapse="+")))
+    
+  }
+  cat(paste0("\n", "model full form: ", paste(modelformula, collapse=""), "\n")) ## for report
+  
+  
+  ### Run differential expression tests (miRNA as outcome)
+  ## make model frame, design matrix, and run voom
+  mf <- model.frame(formula = modelformula, data = phenos)
+  designmatrix <- model.matrix(object = modelformula, data = mf)
+  y <- voom(d, designmatrix, save.plot=TRUE)
+  
+  ## Fit linear models using lmFit
+  fit <- lmFit(y, designmatrix)
+  
+```
+
+Step 5: Finish Up
+```{r}
+### Obtain contrasts for variables of interest
+  ## in case the variable was a factor and the limma name doesn't exactly match the trait name,
+  ## go through these steps
+  limmanames.all <- grep(currtrait, colnames(fit$coefficients), value=TRUE)
+  if(withinteract) {
+    limmaname.trait <- grep("msex", limmanames.all, value=TRUE) ## extract contrast for interaction term
+  } else {
+    limmaname.trait <- grep("msex", limmanames.all, invert=TRUE, value=TRUE) ## exclude interaction term, if any
+  }
+  
+  coeffs.of.interest <- which(colnames(fit$coefficients) == limmaname.trait)  ## get index
+  cat(paste0("contrast extracted for coefficient: ", paste0(colnames(fit$coefficients)[coeffs.of.interest], collapse=", "), "\n"))
+  
+  outcome.contrast <- contrasts.fit(fit, coef=coeffs.of.interest)
+  outcome.contrast <- eBayes(outcome.contrast)
+  
+  top.table <- topTable(outcome.contrast, sort.by = "P", n = Inf)
+  top.table$gene <- rownames(top.table)
+  setDT(top.table)
+  length(top.table[adj.P.Val < 0.05, gene]) ## count number of genes with adjusted P-value < 0.05
+  
+  
+  ##### FINISH #####
+  ## adjust column names
+  toprint <- copy(top.table)
+  setnames(toprint, "gene", "miRNA")
+  setcolorder(toprint, "miRNA")
+  
+  ## add BH P-values
+  toprint[, Pvalue.BH := p.adjust(toprint$P.Value, method="BH")]
+  
+  ## adjust significant digits
+  ## first columns is miRNA identifier, so just copy that column
+  toprint <- data.table(toprint[,1], toprint[, lapply(.SD, signif, 5), .SD=colnames(toprint)[-c(1)]])
+  
+  
+  ## add sig indicator columns
+  toprint[, sig.BH :=Pvalue.BH < 0.05]
+  toprint[, sig.Bonf := P.Value < (0.05/nrow(toprint))]
+  
+  ## order by P.Value
+  setorder(toprint, P.Value)
+  
+  
+  ## rename Pvalue column to match protein results file
+  setnames(toprint, "P.Value", "Pvalue")
+  
+  ## count number of significant miRNAs
+  nsig <- length(which(toprint$sig.BH == TRUE))
+  
+  ### Draw fit plots
+  png(outfile.fit.plot, res=300, units="in", height=5, width=6)
+  par(mfrow=c(2,1), mar=c(4,4,4,1))
+  plot(y$voom.xy$x, y$voom.xy$y, xlab=y$voom.xy$xlab, ylab=y$voom.xy$ylab, main = "voom: Mean-variance trend")
+  lines(y$voom.line$x, y$voom.line$y, col="Red")
+  plotSA(outcome.contrast, main = "Final model: Mean-variance trend")
+  dev.off()
+  
+  ### Draw P-value qq and histogram plots
+  qq1 <- qqunif.plot(toprint$Pvalue,
+                     main = currmodel,
+                     subxlab = paste0(nrow(toprint), " tests"),
+                     par.settings = list(par.sub.text = list(cex = 1)),
+  )
+  
+  hist1 <- ggplot(toprint, aes(x=Pvalue)) +
+    theme_bw() +
+    geom_histogram(bins=100) +
+    labs(title="", subtitle=paste0("BH P< 0.05: ", nsig))
+  
+  grid.arrange(qq1, hist1, ncol=2)
+  ggsave(arrangeGrob(qq1, hist1, ncol=2), file=outfile.qq.plot, height=3, width=6, units="in")
+  
+  ### Add info to log file
+  model.info[i, form.full := paste(modelformula, collapse="")]
+  model.info[i, N := nrow(phenos)]
+  model.info[i, sig.BH := nsig]
+  
+  ### write results file
+  ## write header info
+  write(paste0("## Trait: ", currtrait), file=outfile.txt)
+  write(paste0("## N: ", nrow(phenos)), file=outfile.txt, append=TRUE)
+  write(paste0("## Form: ", paste(modelformula, collapse="")), file=outfile.txt, append=TRUE)
+  write(paste0("## ", currtrait, ": miRNAs significant at BH P-value < 0.05: ", nsig), file=outfile.txt, append=TRUE)
+  write("", file=outfile.txt, append=TRUE) ## whitespace line
+  write.table(toprint, file = outfile.txt, row.names=FALSE, col.names=TRUE, quote=FALSE, sep="\t", append=TRUE)
+  
+}
+
+
+normalized_df <- as.data.frame(normalized)
+if (!is.null(row.names(normalized_df))) {
+```
